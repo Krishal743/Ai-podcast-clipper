@@ -1,0 +1,3 @@
+[submodule "ai-podcast-backend/LR-ASD"]
+	path = ai-podcast-backend/LR-ASD
+	url = https://github.com/Junhua-Liao/LR-ASD.git
