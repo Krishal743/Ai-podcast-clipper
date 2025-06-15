@@ -1,7 +1,18 @@
-from fastapi import Depends
+import json
+import pathlib
+import shutil
+import subprocess
+import time
+import uuid
+import boto3
+from fastapi import Depends, HTTPException , status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from grpclib import Status
 import modal
 from pydantic import BaseModel
+import os
+import whisperx 
+from google import genai
 
 class ProcessVideoRequest(BaseModel):
     s3_key : str
@@ -22,19 +33,133 @@ volume= modal.Volume.from_name(
     "ai-podcast-clipper-model-cache",create_if_missing=True
 )
 
-auth_scheme =  HTTPBearer
+auth_scheme =  HTTPBearer()
 mount_path = "/root/.cache/torch"
+
+
+def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
+    clip_name = f"clip_{clip_index}"
+    s3_key_dir = os.path.dirname(s3_key)
+    output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
+    print(f"Output S3 key: {output_s3_key}")    
+    clip_dir = base_dir / clip_name
+    clip_dir.mkdir(parents=True, exist_ok=True)
+
+    clip_segment_path = clip_dir / f"{clip_name}_segment.mp4"
+    vertical_mp4_path = clip_dir / "pyavi" / "video_out_vertical.mp4"
+    subtitle_output_path = clip_dir / "pyavi" / "video_with_subtitles.mp4"
+
+
 
 @app.cls(gpu="L40s",timeout=900,retries=0, scaledown_window=20,secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")], volumes={mount_path: volume})
 class AiPodcastClipper:
     @modal.enter()
     def load_model(self):
         print("loading models")
-        pass
+        self.whisperx_model= whisperx.load_model("large-v2",device="cuda",compute_type="float16")
+        self.aligment_model,self.metadata=whisperx.load_align_model(language_code="en",device="cuda")
+        print("transcription model loaded")
+        print("opening gemini client")
+        self.gemini_client = genai.client(api_key=os.environ["GEMINI_API_KEY"])
+        print("openened gemini client")
+
+    def transcribe_video(self, base_dir: str,video_path:str)->str:
+        audio_path=base_dir/"audio.wav"
+        extract_cmd=f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        subprocess.run(extract_cmd, shell=True,check=True , capture_output=True)
+
+        print("starting transcription..")
+        start_time=time.time()
+        
+        audio=whisperx.load_audio(str(audio_path))
+        result=self.whisperx_model.transcribe(audio,batch_size=16)
+
+        result = whisperx.align(result["segments"],self.aligment_model,self.metadata,audio,device="cuda",return_char_alignments=False)
+
+        duration= time.time()-start_time
+        print("transcription and alignment took "+ str(duration))
+
+        segments = []
+
+        if "word_segments" in result:
+            for word_segment in result["word_segments"]:
+                segments.append({
+                    "start": word_segment["start"],
+                    "send": word_segment["end"],
+                    "word": word_segment["word"]
+                })
+        
+        return json.dumps(segments)
+
+    def identify_moments(self, transcript : dict):
+        self.gemini_client.models.generate_content(model="gemini-2.5-Flash-Preview-05-20", contents ="""This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
+
+    Your task is to find and extract stories, or question and their corresponding answers from the transcript.
+    Each clip should begin with the question and conclude with the answer.
+    It is acceptable for the clip to include a few additional sentences before a question if it aids in contextualizing the question.
+
+    Please adhere to the following rules:
+    - Ensure that clips do not overlap with one another.
+    - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
+    - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
+    - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
+    - Aim to generate longer clips between 40-60 seconds, and ensure to include as much content from the context as viable.
+
+    Avoid including:
+    - Moments of greeting, thanking, or saying goodbye.
+    - Non-question and answer interactions.
+
+    If there are no valid clips to extract, the output should be an empty list [], in JSON format. Also readable by json.loads() in Python.
+
+    The transcript is as follows:\n\n""" + str(transcript))
+        print(f"Identified moments response: ${response.text}")
+        return response.text
+    
     @modal.fastapi_endpoint(method="POST")
     def process_video(self,request:ProcessVideoRequest,token:HTTPAuthorizationCredentials = Depends(auth_scheme)):
-        print("processing video"+ request.s3_key)
-        pass
+        s3_key=request.s3_key
+        if token.credentials != os.environ["AUTH_TOKEN"]:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect token",headers={"WWW-Authenticate":"Bearer"})
+        
+        run_id=str(uuid.uuid4())
+        base_dir=pathlib.Path("/temp/")/ run_id
+        base_dir.mkdir(parents=True,exist_ok=True)
+
+        video_path=base_dir/"input.mp4"
+        s3_client=boto3.client("s3")
+        s3_client.download_file("podcastclipper",s3_key,str(video_path))
+
+        transcript_segments_json = self.transcribe_video(base_dir,video_path)
+        transcript_segments = json.loads(transcript_segments_json)
+        print("Identifying clip moments")
+        identified_moments_raw = self.identify_moments(transcript_segments)
+
+        cleaned_json_string = identified_moments_raw.strip()
+        if cleaned_json_string.startswith("```json"):
+            cleaned_json_string = cleaned_json_string[len("```json"):].strip()
+        if cleaned_json_string.endswith("```"):
+            cleaned_json_string = cleaned_json_string[:-len("```")].strip()
+        clip_moments = json.loads(cleaned_json_string)
+        if not clip_moments or not isinstance(clip_moments, list):
+            print("Error: Identified moments is not a list")
+            clip_moments = []
+
+        print(clip_moments)
+
+        for index, moment in enumerate(clip_moments[:5]):
+            if "start" in moment and "end" in moment:
+                print("Processing clip" + str(index) + " from " +
+                      str(moment["start"]) + " to " + str(moment["end"]))
+                process_clip(base_dir, video_path, s3_key,
+                             moment["start"], moment["end"], index, transcript_segments)
+
+        if base_dir.exists():
+            print(f"Cleaning up temp dir after {base_dir}")
+            shutil.rmtree(base_dir, ignore_errors=True)
+
+
+
+
 
 @app.local_entrypoint()
 def main():
